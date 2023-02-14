@@ -1,0 +1,69 @@
+variables:
+  IMAGE_NAME: hutinskit/demo-app
+  IMAGE_TAG: python-app-1.0
+  CI_REGISTRY: docker.io
+
+stages:
+  - test
+  - build
+  - deploy
+
+run_tests:
+  stage: test
+  image: python:3.9-slim-buster
+  before_script:
+    - apt-get update && apt-get install make
+  script:
+    - make test
+
+build_image_and_push_to_dockerhub:
+  stage: build
+  #this image works for pushing to docker hub, https://gitlab.com/gitlab-org/gitlab-runner/-/issues/27300
+  image: docker:stable
+  variables:
+    # using "docker" as the host is only possible if you alias the service below
+    DOCKER_HOST: tcp://docker:2375 
+    # could be wrong here but although Docker defaults to overlay2, 
+    # Docker-in-Docker (DIND) does not according to the following GitLab doc: 
+    # https://docs.gitlab.com/ee/ci/docker/using_docker_build.html#use-the-overlayfs-driver
+    DOCKER_DRIVER: overlay2
+    DOCKER_TLS_CERTDIR: ""
+  services:
+    - name: docker:dind
+      alias: docker
+      # in our experience although you'd assume this would be sufficient, this did 
+      # nothing to prevent connection errors without `DOCKER_TLS_CERTDIR` being set 
+      # to an empty string, and I would call that beyond mildly infuriating.
+      # command: ["--tls=false"]
+
+  before_script:
+    - docker login $CI_REGISTRY -u $REGISTRY_USER -p $REGISTRY_PASS
+  
+  script:
+    - docker build -t $IMAGE_NAME:$IMAGE_TAG .
+    - docker push $IMAGE_NAME:$IMAGE_TAG
+deploy:
+  stage: deploy
+  image: ubuntu:latest
+  before_script:
+    ## prerequisite i have installed manually docker in the VM server : apt-get install docker.io
+
+    ## Install ssh-agent if not already installed, it is required by Docker.
+    ## (change apt-get to yum if you use an RPM-based image)
+    ##
+    - 'which ssh-agent || ( apt-get update -y && apt-get install openssh-client -y )'
+    - eval $(ssh-agent -s)
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - echo "$SSH_KEY" | tr -d '\r' | ssh-add -
+    - ssh-keyscan $VM_IPADDRESS >> ~/.ssh/known_hosts
+    - chmod 644 ~/.ssh/known_hosts
+    - '[[ -f /.dockerenv ]] && echo -e "Host *\n\tStrictHostKeyChecking no\n\n" > ~/.ssh/config'
+  script:
+    # deploy this previously created dockerhub image to server created in mine GCP 
+    - cd ~/.ssh
+    - ssh -o StrictHostKeyChecking=no thutinski94@$VM_IPADDRESS "
+      sudo docker login $CI_REGISTRY -u $REGISTRY_USER -p $REGISTRY_PASS &&
+      sudo docker ps -aq | xargs sudo docker stop | xargs sudo docker rm &&
+      sudo docker run -d -p 5000:5000 $IMAGE_NAME:$IMAGE_TAG"
+
